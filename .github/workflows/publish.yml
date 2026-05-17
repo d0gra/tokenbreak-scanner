@@ -1,0 +1,113 @@
+name: Publish to PyPI
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: pip install build twine requests
+
+      - name: Auto-bump version based on PyPI
+        id: bump
+        run: |
+          python -c '
+          import requests
+          import re
+          import sys
+          
+          # 1. Fetch current PyPI version
+          package_name = "tokenbreak-scanner"
+          try:
+              resp = requests.get(f"https://pypi.org/pypi/{package_name}/json")
+              resp.raise_for_status()
+              pypi_version = resp.json()["info"]["version"]
+          except BaseException as e:
+              # Package might not exist yet
+              pypi_version = "0.0.0"
+
+          print(f"Latest PyPI version: {pypi_version}")
+          
+          # 2. Bump patch part
+          parts = pypi_version.split(".")
+          try:
+              patch = int(parts[-1])
+              parts[-1] = str(patch + 1)
+          except ValueError:
+              # Fallback if weird version
+              parts.append("1")
+              
+          new_version = ".".join(parts)
+          print(f"Bumping to: {new_version}")
+          
+          # 3. Update files
+          def replace_in_file(path, pattern, repl):
+              with open(path, "r") as f:
+                  content = f.read()
+              content = re.sub(pattern, repl, content, count=1)
+              with open(path, "w") as f:
+                  f.write(content)
+                  
+          replace_in_file("pyproject.toml", r"version = \"[^\"]+\"", f"version = \"{new_version}\"")
+          
+          # 4. Save to Github Env
+          import os
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"NEW_VERSION={new_version}\n")
+          '
+
+      - name: Run tests
+        run: |
+          pip install -e ".[dev]"
+          python -m pytest -v --timeout=60
+        env:
+          TOKENIZERS_PARALLELISM: "false"
+
+      - name: Build wheel and sdist
+        run: python -m build
+
+      - name: Upload to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        # Still keeping skip-existing just in case
+        run: twine upload --skip-existing dist/*
+
+      - name: Commit and Tag new version
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          git add pyproject.toml
+          # Only commit if there are changes
+          git diff --quiet && git diff --staged --quiet || (git commit -m "chore: bump version to ${{ env.NEW_VERSION }} [skip ci]" && git push origin main)
+          
+          # Create and push tag (use -f to avoid failing if the tag exists)
+          git tag -f "v${{ env.NEW_VERSION }}"
+          git push -f origin "v${{ env.NEW_VERSION }}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: "v${{ env.NEW_VERSION }}"
+          files: dist/*
+          generate_release_notes: true
