@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tokenbreak-scanner"
-version = "0.1.7"
+version = "0.1.8"
 description = "Detect TokenBreak adversarial vulnerabilities in LLMs, classifiers, and encoders. Audit HuggingFace and custom tokenizer artifacts for BPE/WordPiece attack surface in the AI supply chain."
 readme = "README.md"
 requires-python = ">=3.9"
