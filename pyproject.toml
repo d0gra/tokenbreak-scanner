@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tokenbreak-scanner"
 version = "0.1.8"
-description = "Detect TokenBreak adversarial vulnerabilities in LLMs, classifiers, and encoders. Audit HuggingFace and custom tokenizer artifacts for BPE/WordPiece attack surface in the AI supply chain."
+description = "Scan open-source and custom model tokenizers for TokenBreak adversarial vulnerabilities. Know your model's risk before you fine-tune, deploy, or ship."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "AGPL-3.0-or-later" }
@@ -14,9 +14,15 @@ authors = [
 ]
 keywords = [
     "tokenbreak",
+    "tokenizer",
+    "llm-security",
+    "model-evaluation",
+    "model-selection",
+    "finetuning",
+    "open-source-models",
+    "ai-supply-chain",
     "adversarial-attack",
     "nlp-security",
-    "tokenizer",
     "vulnerability-scanner",
     "bpe",
     "wordpiece",
@@ -24,12 +30,9 @@ keywords = [
     "sentencepiece",
     "huggingface",
     "transformers",
-    "llm-security",
     "model-auditing",
-    "red-teaming",
     "ai-safety",
     "mlops",
-    "content-moderation",
     "guardrails",
 ]
 classifiers = [
