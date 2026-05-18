@@ -64,6 +64,9 @@ class TestCliOutput:
         assert data["model_type"] == "deberta-v2"
         assert data["tokenizer_algorithm"] == "Unigram"
         assert data["vulnerable_to_tokenbreak"] is False
+        # Heavy metadata must be excluded from CI/CD-friendly JSON output
+        assert "config_metadata" not in data
+        assert "tokenizer_metadata" not in data
 
     def test_missing_directory(self) -> None:
         """Non-existent path without --download raises an error."""

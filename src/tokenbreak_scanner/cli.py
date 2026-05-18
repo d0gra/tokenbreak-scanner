@@ -63,8 +63,13 @@ def _build_table(report: ScannerReport) -> Table:
 
 
 def _print_json(report: ScannerReport, attack_result: Optional[AttackValidationResult] = None) -> None:
-    """Print report as JSON."""
-    data = report.model_dump(mode="json")
+    """Print report as JSON.
+
+    Excludes ``config_metadata`` and ``tokenizer_metadata`` which contain
+    raw artifact contents (including the full vocab) and would make CI/CD
+    output unusably large.
+    """
+    data = report.model_dump(mode="json", exclude={"config_metadata", "tokenizer_metadata"})
     if attack_result is not None:
         data["attack_validation"] = attack_result.model_dump(mode="json")
     click.echo(json.dumps(data, indent=2))

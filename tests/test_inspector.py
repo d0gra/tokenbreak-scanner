@@ -48,7 +48,7 @@ class TestInspectModelLocal:
         assert report.tokenizer_algorithm == TokenizerAlgorithm.BPE
         assert report.vulnerable_to_tokenbreak is True
         assert report.risk_level == RiskLevel.HIGH
-        assert "vulnerability" in report.recommendation.lower()
+        assert "vulnerable" in report.recommendation.lower()
 
     def test_deberta_safe(self, tmp_path: Path) -> None:
         """Simulate a DeBERTa-v2 model directory with Unigram tokenizer."""
@@ -70,7 +70,7 @@ class TestInspectModelLocal:
         assert report.tokenizer_algorithm == TokenizerAlgorithm.UNIGRAM
         assert report.vulnerable_to_tokenbreak is False
         assert report.risk_level == RiskLevel.LOW
-        assert "immune" in report.recommendation.lower()
+        assert "no action needed" in report.recommendation.lower()
 
     def test_distilbert_vulnerable(self, tmp_path: Path) -> None:
         """Simulate a DistilBERT model directory with WordPiece tokenizer."""

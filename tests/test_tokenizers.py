@@ -91,20 +91,21 @@ class TestVulnerability:
 class TestRecommendation:
     def test_unigram(self) -> None:
         rec = get_recommendation(TokenizerAlgorithm.UNIGRAM)
-        assert "structurally immune" in rec
+        assert "No action needed" in rec
+        assert "resistant" in rec
 
     def test_bpe(self) -> None:
         rec = get_recommendation(TokenizerAlgorithm.BPE)
-        assert "VULNERABILITY" in rec
-        assert "Pre-Mapping Defense" in rec
+        assert "vulnerable" in rec
+        assert "Unigram-based" in rec
 
     def test_wordpiece(self) -> None:
         rec = get_recommendation(TokenizerAlgorithm.WORDPIECE)
-        assert "VULNERABILITY" in rec
+        assert "vulnerable" in rec
 
     def test_unknown_recommendation(self) -> None:
         rec = get_recommendation(TokenizerAlgorithm.UNKNOWN)
-        assert "manual architectural audit" in rec
+        assert "Could not determine" in rec
 
 
 class TestMapCompleteness:

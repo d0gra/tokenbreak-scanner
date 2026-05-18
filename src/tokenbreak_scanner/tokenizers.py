@@ -247,29 +247,30 @@ def get_recommendation(algorithm: TokenizerAlgorithm) -> str:
     """Return remediation recommendation based on algorithm."""
     if algorithm == TokenizerAlgorithm.UNIGRAM:
         return (
-            "Risk Assessment: SAFE (Cleared for Deployment). "
-            "Model utilizes Unigram tokenization, which is structurally immune to TokenBreak character-level perturbation attacks. "
-            "No further remediation is required for AI supply chain deployment."
+            "No action needed. This model uses Unigram tokenization, which is "
+            "structurally resistant to TokenBreak character-level perturbation attacks. "
+            "Safe to fine-tune and deploy."
         )
     if algorithm in (TokenizerAlgorithm.BPE, TokenizerAlgorithm.WORDPIECE):
         return (
-            "Risk Assessment: CRITICAL VULNERABILITY DETECTED. "
-            "The implemented BPE/WordPiece tokenization scheme exposes this model to known TokenBreak adversarial evasion attacks. "
-            "MITIGATION ACTION: (1) Implement a Unigram-based token pre-processor to sanitize inputs (Pre-Mapping Defense), "
-            "or (2) Migrate the system architecture to resilient alternatives (e.g., DeBERTa-v3 or XLM-RoBERTa) prior to production release."
+            "This model uses BPE/WordPiece tokenization, which is vulnerable to "
+            "TokenBreak adversarial evasion attacks. Before deploying in a "
+            "security-sensitive context, consider: "
+            "(1) Adding a Unigram-based input pre-processor to neutralize "
+            "character-level perturbations, or "
+            "(2) Evaluating resistant alternatives like DeBERTa-v3 or "
+            "XLM-RoBERTa that use Unigram tokenization natively."
         )
     if algorithm == TokenizerAlgorithm.SENTENCEPIECE:
         return (
-            "Risk Assessment: CONDITIONAL EXPOSURE. "
-            "SentencePiece encapsulation detected. "
-            "ACTION REQUIRED: Manually audit the upstream `tokenizer.json` configuration to guarantee reliance on Unigram logic. "
-            "Confirmed Unigram implementations inherently mitigate TokenBreak exploitation risks."
+            "SentencePiece detected. SentencePiece can wrap either Unigram (resistant) or "
+            "BPE (vulnerable) under the hood. Verify that the underlying algorithm is Unigram "
+            "by checking tokenizer.json or model documentation before deploying."
         )
     return (
-        "Risk Assessment: UNVERIFIED EXPOSURE. "
-        "Automated telemetry could not establish a definitive tokenization architecture fingerprint. "
-        "ACTION REQUIRED: Mandate a manual architectural audit of `tokenizer.json` and model documentation "
-        "to certify compliance with AI supply chain security standards."
+        "Could not determine the tokenization algorithm automatically. "
+        "Manually inspect tokenizer.json and model documentation to confirm "
+        "whether BPE or WordPiece is used before deploying."
     )
 
 
