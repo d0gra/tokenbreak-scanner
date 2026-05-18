@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tokenbreak-scanner"
-version = "0.1.9"
+version = "0.1.10"
 description = "Scan open-source and custom model tokenizers for TokenBreak adversarial vulnerabilities. Know your model's risk before you fine-tune, deploy, or ship."
 readme = "README.md"
 requires-python = ">=3.9"
