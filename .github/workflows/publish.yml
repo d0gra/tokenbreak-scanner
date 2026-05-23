@@ -30,51 +30,47 @@ jobs:
       - name: Auto-bump version based on PyPI
         id: bump
         run: |
-          python -c '
+          cat << 'PYEOF' > bump_version.py
           import requests
           import re
           import sys
-          
-          # 1. Fetch current PyPI version
+          import os
+
           package_name = "tokenbreak-scanner"
           try:
               resp = requests.get(f"https://pypi.org/pypi/{package_name}/json")
               resp.raise_for_status()
               pypi_version = resp.json()["info"]["version"]
-          except BaseException as e:
-              # Package might not exist yet
+          except BaseException:
               pypi_version = "0.0.0"
 
           print(f"Latest PyPI version: {pypi_version}")
-          
-          # 2. Bump patch part
+
           parts = pypi_version.split(".")
           try:
               patch = int(parts[-1])
               parts[-1] = str(patch + 1)
           except ValueError:
-              # Fallback if weird version
               parts.append("1")
-              
+
           new_version = ".".join(parts)
           print(f"Bumping to: {new_version}")
-          
-          # 3. Update files
+
           def replace_in_file(path, pattern, repl):
               with open(path, "r") as f:
                   content = f.read()
               content = re.sub(pattern, repl, content, count=1)
               with open(path, "w") as f:
                   f.write(content)
-                  
-          replace_in_file("pyproject.toml", r"version = \"[^\"]+\"", f"version = \"{new_version}\"")
+
+          replace_in_file("pyproject.toml", r'version = "[^"]+"', f'version = "{new_version}"')
           replace_in_file("docs/index.html", r'"softwareVersion"\s*:\s*"[^"]+"', f'"softwareVersion": "{new_version}"')
-          
-          # 4. Save to Github Env
-          import os
+
           with open(os.environ["GITHUB_ENV"], "a") as f:
               f.write(f"NEW_VERSION={new_version}\n")
-          '
+          PYEOF
+
+          python bump_version.py
 
       - name: Run tests
         run: |
