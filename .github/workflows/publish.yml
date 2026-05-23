@@ -68,6 +68,7 @@ jobs:
                   f.write(content)
                   
           replace_in_file("pyproject.toml", r"version = \"[^\"]+\"", f"version = \"{new_version}\"")
+          replace_in_file("docs/index.html", r'"softwareVersion"\s*:\s*"[^"]+"', f'"softwareVersion": "{new_version}"')
           
           # 4. Save to Github Env
           import os
@@ -81,6 +82,9 @@ jobs:
           python -m pytest -v --timeout=60
         env:
           TOKENIZERS_PARALLELISM: "false"
+
+      - name: Verify version sync
+        run: python scripts/check_version_sync.py
 
       - name: Build wheel and sdist
         run: python -m build
@@ -97,7 +101,7 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           
-          git add pyproject.toml
+          git add pyproject.toml docs/index.html
           # Only commit if there are changes
           git diff --quiet && git diff --staged --quiet || (git commit -m "chore: bump version to ${{ env.NEW_VERSION }} [skip ci]" && git push origin main)
           
