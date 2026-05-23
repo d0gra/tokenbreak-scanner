@@ -131,10 +131,11 @@ Insert a **Unigram tokenizer** upstream of the target classifier. Unigram tokeni
 | Dimension | Capability |
 |---|---|
 | **Static Artifact Analysis** | Parses `config.json`, `tokenizer.json`, `tokenizer_config.json` — no model weights required |
-| **Algorithm Detection** | Identifies BPE, WordPiece, Unigram, SentencePiece with weighted confidence |
-| **Vulnerability Assessment** | Binary risk classification: HIGH (vulnerable) or LOW (resistant) |
-| **Evidence Tree** | 6-signal weighted aggregation: tokenizer model, runtime backend, source fingerprint, remote source, config class, architecture fallback |
-| **Attack Validation** *(optional)* | Loads weights and runs `BreakPrompt` generative perturbation to empirically verify the bypass |
+| **Algorithm Detection** | Identifies BPE, WordPiece, Unigram, SentencePiece from structural metadata with high confidence |
+| **Vulnerability Assessment** | Binary risk classification: HIGH (vulnerable) or LOW (resistant) based solely on detected algorithm |
+| **Evidence Tree** | 5-signal structural detection: `tokenizer.json`, runtime Rust backend, class map, source fingerprint, architecture taxonomy |
+| **Behavioral Diagnostic** *(informational)* | Stealthy probe with invisible-Unicode perturbations to flag unexpected sensitivity, never overriding structural signals |
+| **Attack Validation** *(optional, requires weights + GPU)* | Loads model weights and runs the `BreakPrompt` adversarial test to empirically verify bypass exploitability |
 | **CI/CD Integration** | JSON output + deterministic exit codes for pipeline gating |
 
 ---
@@ -181,6 +182,8 @@ $ tokenbreak-scan distilbert-base-uncased --download
     1. [tokenizer.json model.type] weight=0.40 -> WordPiece
     2. [runtime._tokenizer.model] weight=0.40 -> WordPiece
     3. [tokenizer_config.json class] weight=0.20 -> WordPiece
+  Behavioral Diagnostic:
+    shifted=3 total=10 fragility=0.30 | consistent
 ======================================================================
   Recommendation:
     This model uses WordPiece tokenization, which is vulnerable to
@@ -214,6 +217,14 @@ $ tokenbreak-scan <model> --output json
     {"signal": "tokenizer.json model.type", "inferred": "WordPiece", "weight": 0.40},
     {"signal": "runtime._tokenizer.model", "inferred": "WordPiece", "weight": 0.40}
   ],
+  "behavioral_diagnostic": {
+    "shifted": 3,
+    "total": 10,
+    "fragility": 0.30,
+    "detail": "3/10 invisible-perturbation probes altered tokenization (consistent)",
+    "consistent_with_algorithm": true,
+    "warning": null
+  },
   "recommendation": "...",
   "source": "/path/to/model"
 }
@@ -296,24 +307,43 @@ def tokenbreak_gate(model_path: str) -> None:
 tokenbreak_scanner/
 ├── __init__.py          # Package version
 ├── cli.py               # Click CLI - Rich table / JSON / exit-code interface
-├── inspector.py         # Introspection engine - 6-signal weighted aggregation
-├── models.py            # Pydantic schemas: ScannerReport, DetectionSource, RiskLevel
-├── tokenizers.py        # Algorithm detection, model-family taxonomy, runtime inspection
-└── validator.py         # Optional empirical attack validation via BreakPrompt
+├── inspector.py         # Introspection engine - structural signal + behavioral diagnostic
+├── models.py            # Pydantic schemas: ScannerReport, DetectionSource, BehavioralDiagnostic, RiskLevel
+├── tokenizers.py        # Algorithm detection, model-family taxonomy, runtime inspection, sensitivity probe
+└── validator.py         # Optional empirical attack validation via BreakPrompt (requires PyTorch + model weights)
 ```
 
-### Detection Signal Architecture
+### Structural Detection (Determines Algorithm & Risk)
 
-Confidence is derived from a weighted-majority vote over orthogonal detection channels:
+Algorithm and risk level are derived solely from structural metadata — never from empirical behavior probes.
+Confidence is a weighted-majority vote over orthogonal detection channels:
 
 | Signal | Weight | Source | Failure Mode |
 |---|---|---|---|
-| `tokenizer.json` model type | 0.40 | HuggingFace / Custom Model Rust tokenizer artifact | File absent |
-| Runtime `_tokenizer.model` | 0.40 | Live Rust backend deserialization | `tokenizers` not installed |
-| Source-code fingerprint | 0.30 | Python `tokenization_*.py` keyword matching | File not downloaded |
-| Remote source file | 0.30 | HF Hub tokenizer module (trust_remote_code) | Network unavailable |
-| `tokenizer_config.json` class | 0.20 | Static config metadata | Config absent |
-| `config.json` model_type | 0.15 | Architecture taxonomy fallback | Config absent |
+| `tokenizer.json` model type | 0.40 | HuggingFace `tokenizer.json` Rust model metadata | File absent |
+| Runtime `_tokenizer.model` | 0.40 | Live `tokenizers` Rust backend `type(model).__name__` | `tokenizers` not installed |
+| Source-code fingerprint | 0.30 | Python `tokenization_*.py` keyword matching (keyword/regex based) | File not downloaded |
+| Remote source file | 0.30 | HF Hub tokenizer module for `trust_remote_code` models | Network unavailable |
+| `tokenizer_config.json` class | 0.20 | Static config metadata: `tokenizer_class` → known class map | Config absent |
+| `config.json` model_type | 0.15 | Architecture taxonomy fallback: `model_type` → known algorithm map | Config absent |
+
+### Behavioral Diagnostic Probe (Informational Only)
+
+When a tokenizer can be loaded, a **diagnostic probe** runs stealthy invisible-Unicode perturbations
+(zero-width spaces, soft hyphens, etc.) on safety-critical words.  It measures tokenization sensitivity
+but **never overrides the structurally-detected algorithm**.
+
+| Algorithm | Expected Probe Behavior |
+|---|---|
+| **BPE / WordPiece** | High sensitivity expected; any fragility is consistent with vulnerability |
+| **Unigram** | Low sensitivity expected; invisible characters should not shift word boundaries |
+| **SentencePiece** | Ambiguous until resolved; probe is advisory |
+
+If the probe shows *unexpected* fragility (e.g. structural says Unigram but probe shows many shifts), a
+`warning` is appended to the recommendation: *"Consider manual review or use `--validate` for a live attack test."*
+
+This prevents the old bug where context-dependent tokenization in Unigram models was falsely labeled
+"BPE vulnerable" by an over-trusted behavior test.
 
 ---
 

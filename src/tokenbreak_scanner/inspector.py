@@ -15,8 +15,9 @@ from typing import Any, Optional
 from transformers import AutoTokenizer
 from transformers.utils import cached_file
 
-from .models import DetectionSource, RiskLevel, ScannerReport, TokenizerAlgorithm
+from .models import BehavioralDiagnostic, DetectionSource, RiskLevel, ScannerReport, TokenizerAlgorithm
 from .tokenizers import (
+    _is_behavior_consistent_with_algorithm,
     detect_from_remote_source,
     detect_from_runtime_tokenizer,
     detect_from_source_code,
@@ -524,39 +525,13 @@ def inspect_model(
         )
 
     # ═══════════════════════════════════════════════════════════════
-    # GROUND-TRUTH SIGNAL: actual tokenization behavior test
-    # This is the definitive TokenBreak test — it replicates the
-    # attack by prepending characters and checking if tokenization
-    # of the base word changes.  This has ZERO false positives.
-    # ═══════════════════════════════════════════════════════════════
-    tokenization_vulnerable: bool | None = None
-    fragility_score: float = 0.0
-    tokenization_detail: str = ""
-
-    if loaded_tokenizer is not None and not isinstance(loaded_tokenizer, type(_load_json)):
-        tokenization_vulnerable, fragility_score, tokenization_detail = (
-            detect_from_tokenization_behavior(loaded_tokenizer)
-        )
-        if tokenization_detail:
-            sources.append(
-                DetectionSource(
-                    signal="tokenization_behavior_test",
-                    value=f"fragility={fragility_score:.2f}",
-                    inferred="BPE" if tokenization_vulnerable else "Unigram",
-                    weight=1.0,  # Ground truth — always trusted over metadata
-                    reason=tokenization_detail,
-                )
-            )
-            logger.info("Ground-truth tokenization test: %s", tokenization_detail)
-
-    # ═══════════════════════════════════════════════════════════════
-    # DECISION TREE: determine algorithm with proper conflict handling
-    # Priority: ground-truth test > tokenizer.json > runtime > config
+    # DECISION TREE: structural signals determine algorithm
+    # Priority: tokenizer.json > runtime Rust > class map > config
+    # The behavior probe is consulted ONLY when no structural signals
+    # exist (unknown custom tokenizers), and with heavy caveats.
     # ═══════════════════════════════════════════════════════════════
     algorithm, confidence_score = _decide_algorithm(
         sources=sources,
-        tokenization_vulnerable=tokenization_vulnerable,
-        fragility_score=fragility_score,
         algorithm_from_tokenizer_json=algorithm_from_tokenizer_json,
         model_path=model_path,
     )
@@ -578,13 +553,38 @@ def inspect_model(
             algorithm = resolved
             confidence_score = max(confidence_score, 0.90)
 
-    # Risk assessment
+    # Build behavioral diagnostic (post-detection, so we can check consistency)
+    behavioral_diagnostic: BehavioralDiagnostic | None = None
+    if loaded_tokenizer is not None and not isinstance(loaded_tokenizer, type(_load_json)):
+        probe_result = detect_from_tokenization_behavior(loaded_tokenizer, use_invisible=True)
+        fragility = probe_result.get("fragility", 0.0)
+        consistent = _is_behavior_consistent_with_algorithm(algorithm, fragility)
+        warning = None
+        if not consistent:
+            warning = (
+                f"Structural signals suggest {algorithm.value}, but the diagnostic probe "
+                f"reports fragility={fragility:.2f} — unexpectedly high for this algorithm. "
+                f"Consider manual review or use `--validate` for a live attack test."
+            )
+            logger.warning(warning)
+        behavioral_diagnostic = BehavioralDiagnostic(
+            shifted=probe_result.get("shifted", 0),
+            total=probe_result.get("total", 0),
+            fragility=fragility,
+            detail=probe_result.get("detail", ""),
+            consistent_with_algorithm=consistent,
+            warning=warning,
+        )
+
+    # Risk assessment — based ONLY on structurally-detected algorithm
     vulnerable = is_vulnerable(algorithm)
     risk_level = RiskLevel.HIGH if vulnerable else RiskLevel.LOW
     if algorithm == TokenizerAlgorithm.UNKNOWN:
         risk_level = RiskLevel.UNKNOWN
 
     recommendation = get_recommendation(algorithm)
+    if behavioral_diagnostic is not None and behavioral_diagnostic.warning:
+        recommendation += "\n\n" + behavioral_diagnostic.warning
 
     return ScannerReport(
         model_name=Path(source).name if Path(source).exists() else source,
@@ -603,9 +603,9 @@ def inspect_model(
             "config.json": config,
             "tokenizer_config.json": tokenizer_config,
             "detection_confidence": confidence_score,
-            "fragility_score": fragility_score,
         },
         tokenizer_metadata=tokenizer_json or {},
+        behavioral_diagnostic=behavioral_diagnostic,
     )
 
 
@@ -615,37 +615,24 @@ def inspect_model(
 
 def _decide_algorithm(
     sources: list[DetectionSource],
-    tokenization_vulnerable: bool | None,
-    fragility_score: float,
     algorithm_from_tokenizer_json: TokenizerAlgorithm | None,
     model_path: Path,
 ) -> tuple[TokenizerAlgorithm, float]:
-    """Decision tree for algorithm detection with proper confidence.
+    """Decision tree for algorithm detection.  Structural signals only.
 
     Priority order (highest first):
-    1. Ground-truth tokenization behavior test  → confidence 0.98
-    2. tokenizer.json explicit type             → confidence 0.85–0.95
-    3. Runtime Rust backend inspection          → confidence 0.75
-    4. Tokenizer class name map                 → confidence 0.60
-    5. Source code fingerprint                  → confidence 0.50
-    6. model_type from config.json              → confidence 0.40
-    7. Remote source scan                       → confidence 0.45
+    1. tokenizer.json explicit type             → confidence 0.85–0.95
+    2. Runtime Rust backend inspection          → confidence 0.75
+    3. Tokenizer class name map                 → confidence 0.60
+    4. Source code fingerprint                  → confidence 0.50
+    5. model_type from config.json              → confidence 0.40
+    6. Remote source scan                       → confidence 0.45
 
-    Confidence is reduced when signals disagree.
+    The diagnostic behavior probe is NEVER used to override structural
+    signals.  Confidence is reduced when structural signals disagree.
     """
-    # Tier 1: Ground-truth test always wins
-    if tokenization_vulnerable is not None:
-        algorithm = TokenizerAlgorithm.BPE if tokenization_vulnerable else TokenizerAlgorithm.UNIGRAM
-        confidence = 0.98  # Near-certain, but leave room for edge cases
-        logger.info(
-            "Decision: %s (confidence=%.2f) [ground-truth tokenization test, fragility=%.2f]",
-            algorithm.value, confidence, fragility_score,
-        )
-        return algorithm, confidence
-
-    # Tier 2: tokenizer.json is authoritative if present
+    # Tier 1: tokenizer.json is authoritative if present
     if algorithm_from_tokenizer_json is not None:
-        # Check for conflicts with other signals
         algo = algorithm_from_tokenizer_json
         conflicts = _count_conflicts(algo, sources)
         if conflicts == 0:
@@ -658,7 +645,7 @@ def _decide_algorithm(
                      algo.value, confidence, conflicts)
         return algo, confidence
 
-    # Tier 3: Runtime inspection
+    # Tier 2: Runtime inspection
     runtime_signals = [s for s in sources if s.signal == "runtime._tokenizer.model"]
     if runtime_signals:
         algo = TokenizerAlgorithm(runtime_signals[0].inferred)
@@ -666,15 +653,15 @@ def _decide_algorithm(
         logger.info("Decision: %s (confidence=%.2f) [runtime inspection]", algo.value, confidence)
         return algo, confidence
 
-    # Tier 4: Weighted vote from remaining signals (with conflict penalty)
+    # Tier 3: Weighted vote from remaining signals (with conflict penalty)
     algo, raw_confidence = _weighted_vote_with_conflicts(sources)
     if algo != TokenizerAlgorithm.UNKNOWN:
         logger.info("Decision: %s (confidence=%.2f) [weighted vote from config signals]",
                      algo.value, raw_confidence)
         return algo, raw_confidence
 
-    # Tier 5: Nothing found — UNKNOWN
-    logger.info("Decision: UNKNOWN (confidence=0.10) [no signals available]")
+    # Tier 4: Nothing found — UNKNOWN
+    logger.info("Decision: UNKNOWN (confidence=0.10) [no structural signals available]")
     return TokenizerAlgorithm.UNKNOWN, 0.10
 
 

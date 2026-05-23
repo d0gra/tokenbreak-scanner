@@ -56,10 +56,16 @@ def _build_table(report: ScannerReport) -> Table:
     table.add_row("Risk Level", Text(report.risk_level.value, style=f"bold {risk_color}"))
     table.add_row("Source", report.source)
 
-    # Fragility score (ground-truth test result)
-    fragility = report.config_metadata.get("fragility_score", None)
-    if fragility is not None and isinstance(fragility, (int, float)) and fragility > 0:
-        table.add_row("Token Fragility", _fragility_bar(float(fragility)))
+    # Behavioral diagnostic (informational, not used for algorithm detection)
+    if report.behavioral_diagnostic is not None:
+        bd = report.behavioral_diagnostic
+        table.add_row(
+            "Behavioral Diagnostic",
+            f"{bd.shifted}/{bd.total} stealthy perturbations shifted tokenization "
+            f"(fragility={bd.fragility:.2f})",
+        )
+        if bd.warning:
+            table.add_row("⚠ Diagnostic Warning", Text(bd.warning, style="bold yellow"))
 
     table.add_row("Recommendation", report.recommendation)
 
@@ -88,10 +94,11 @@ def _build_batch_summary_table(reports: list[ScannerReport]) -> Table:
 
     for report in reports:
         vuln_text = Text("YES", style="bold red") if report.vulnerable_to_tokenbreak else Text("NO", style="bold green")
-        fragility = report.config_metadata.get("fragility_score", None)
-        fragility_str = f"{fragility:.2f}" if isinstance(fragility, (int, float)) else "N/A"
+        bd = report.behavioral_diagnostic
+        fragility_str = f"{bd.fragility:.2f}" if bd is not None else "N/A"
+        warn_marker = " ⚠" if (bd is not None and bd.warning) else ""
         table.add_row(
-            report.model_name,
+            report.model_name + warn_marker,
             report.tokenizer_algorithm.value,
             vuln_text,
             f"{report.confidence_score:.2f}",

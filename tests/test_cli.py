@@ -22,10 +22,20 @@ def _mock_heavy_deps():
             "tokenbreak_scanner.inspector.detect_from_remote_source",
             return_value=(None, ""),
         ),
-        # Mock the ground-truth tokenization test since no real tokenizer
+        # Mock the diagnostic tokenization probe since no real tokenizer
         patch(
             "tokenbreak_scanner.inspector.detect_from_tokenization_behavior",
-            return_value=(False, 0.0, "mocked: no tokenizer available"),
+            return_value={
+                "shifted": 0,
+                "total": 80,
+                "fragility": 0.0,
+                "inconsistent_with_unigram": False,
+                "detail": "mocked: no tokenizer available",
+            },
+        ),
+        patch(
+            "tokenbreak_scanner.inspector._is_behavior_consistent_with_algorithm",
+            return_value=True,
         ),
     ):
         yield

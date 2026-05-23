@@ -24,7 +24,17 @@ def _mock_heavy_deps():
         ),
         patch(
             "tokenbreak_scanner.inspector.detect_from_tokenization_behavior",
-            return_value=(False, 0.0, "mocked: no tokenizer available"),
+            return_value={
+                "shifted": 0,
+                "total": 80,
+                "fragility": 0.0,
+                "inconsistent_with_unigram": False,
+                "detail": "mocked: no tokenizer available",
+            },
+        ),
+        patch(
+            "tokenbreak_scanner.inspector._is_behavior_consistent_with_algorithm",
+            return_value=True,
         ),
     ):
         yield
@@ -239,7 +249,7 @@ class TestDecisionTree:
         # tokenizer.json wins → BPE
         assert report.tokenizer_algorithm == TokenizerAlgorithm.BPE
         assert report.vulnerable_to_tokenbreak is True
-        # Confidence should be high but not 0.98 (no ground-truth test)
+        # Confidence should be high — structural signals are trusted
         assert report.confidence_score >= 0.70
 
     def test_no_tokenizer_json_falls_back_to_runtime(self, tmp_path: Path) -> None:
@@ -276,6 +286,41 @@ class TestDecisionTree:
 
         # With conflicting signals and no tokenizer.json, confidence should be moderate
         assert report.confidence_score < 0.90
+
+
+class TestBehavioralDiagnostic:
+    """Test that the behavioral diagnostic probe is reported independently."""
+
+    def test_behavioral_diagnostic_none_when_no_tokenizer(self, tmp_path: Path) -> None:
+        """When no tokenizer can be loaded, behavioral_diagnostic should be None."""
+        model_dir = tmp_path / "no-tok"
+        model_dir.mkdir()
+
+        tokenizer_json = {"model": {"type": "Unigram"}}
+        (model_dir / "tokenizer.json").write_text(json.dumps(tokenizer_json))
+
+        report = inspect_model(str(model_dir))
+        # AutoTokenizer fails in mock → no loaded_tokenizer → no diagnostic
+        assert report.behavioral_diagnostic is None
+
+    def test_deberta_unigram_no_behavioral_override(self, tmp_path: Path) -> None:
+        """XLM-RoBERTa/DeBERTa Unigram models should not be overridden by behavior probe."""
+        model_dir = tmp_path / "unigram-structural"
+        model_dir.mkdir()
+
+        tokenizer_json = {"model": {"type": "Unigram"}}
+        tokenizer_config = {"tokenizer_class": "XLMRobertaTokenizer"}
+        config = {"model_type": "xlm-roberta"}
+
+        (model_dir / "config.json").write_text(json.dumps(config))
+        (model_dir / "tokenizer_config.json").write_text(json.dumps(tokenizer_config))
+        (model_dir / "tokenizer.json").write_text(json.dumps(tokenizer_json))
+
+        report = inspect_model(str(model_dir))
+        # Structural signals say Unigram → Unigram, regardless of any mock behavior
+        assert report.tokenizer_algorithm == TokenizerAlgorithm.UNIGRAM
+        assert report.vulnerable_to_tokenbreak is False
+        assert report.risk_level == RiskLevel.LOW
 
 
 class TestConfidenceModel:

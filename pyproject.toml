@@ -129,3 +129,6 @@ where = ["src"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-v --tb=short"
+markers = [
+    "integration: tests that download and scan real HuggingFace models",
+]

@@ -7,6 +7,7 @@ from tokenbreak_scanner.tokenizers import (
     MODEL_FAMILY_MAP,
     MODEL_TYPE_MAP,
     TOKENIZER_CLASS_MAP,
+    _is_behavior_consistent_with_algorithm,
     detect_from_tokenization_behavior,
     detect_tokenizer_from_config,
     detect_tokenizer_from_json,
@@ -133,55 +134,61 @@ class TestMapCompleteness:
 
 
 class TestTokenizationBehavior:
-    """Test the ground-truth tokenization behavior detection."""
+    """Test the diagnostic tokenization sensitivity probe."""
 
-    def test_none_tokenizer_returns_false(self) -> None:
-        """None tokenizer should return not-vulnerable."""
-        vulnerable, fragility, detail = detect_from_tokenization_behavior(None)
-        assert vulnerable is False
-        assert fragility == 0.0
-        assert "No tokenizer" in detail
+    def test_none_tokenizer_returns_empty(self) -> None:
+        """None tokenizer should return empty diagnostic."""
+        result = detect_from_tokenization_behavior(None)
+        assert result["shifted"] == 0
+        assert result["fragility"] == 0.0
+        assert "No tokenizer" in result["detail"]
 
     def test_mock_tokenizer_encoding(self) -> None:
-        """Test with a mock tokenizer that simulates BPE behavior."""
+        """Test with a mock tokenizer that simulates BPE fragility."""
         class MockTokenizer:
             def encode(self, text, add_special_tokens=False):
-                # Simulate BPE: prepend changes tokenization
-                if text.startswith("Xpassword"):
+                # Simulate BPE: invisible prepend changes tokenization
+                if text.startswith("\u200bpassword"):
                     return [100, 200, 300, 400, 500]  # Different tokens!
-                if text.startswith("password"):
+                if text == "password":
                     return [200, 300, 400, 500]
                 # All other words: no shift
                 return [42] * len(text)
 
-        vulnerable, fragility, detail = detect_from_tokenization_behavior(MockTokenizer())
-        assert vulnerable is True
-        assert fragility > 0.0
-        assert "password" in detail
+        result = detect_from_tokenization_behavior(MockTokenizer())
+        assert result["shifted"] > 0
+        assert result["fragility"] > 0.0
+        assert "password" in result["detail"]
 
     def test_mock_unigram_tokenizer(self) -> None:
-        """Test with a mock tokenizer that simulates Unigram behavior (resistant)."""
+        """Test with a mock tokenizer that simulates Unigram stability."""
         class MockUnigramTokenizer:
             def encode(self, text, add_special_tokens=False):
-                # Simulate Unigram: prepend doesn't change word tokenization
+                # Simulate Unigram: prepend changes length but word portion stable
+                # Prepend adds one char → one token at start, rest same
+                if text.startswith("\u200b"):
+                    base = text[1:]  # strip the zero-width char
+                    base_ids = [hash(c) % 1000 + 1000 for c in base]
+                    return [999] + base_ids
                 tokens = [hash(c) % 1000 + 1000 for c in text]
                 return tokens
 
-        vulnerable, fragility, detail = detect_from_tokenization_behavior(MockUnigramTokenizer())
-        assert vulnerable is False
-        assert fragility == 0.0
-        assert "resistant" in detail
+        result = detect_from_tokenization_behavior(MockUnigramTokenizer())
+        assert result["shifted"] == 0
+        assert result["fragility"] == 0.0
+        assert "No shifts detected" in result["detail"]
 
     def test_short_perturbed_sequence_skipped(self) -> None:
-        """When perturbed sequence is same length or shorter, skip test."""
+        """When perturbed sequence is same length or shorter, count as tested but no shift."""
         class ShortTokenizer:
             def encode(self, text, add_special_tokens=False):
                 # Always return same-length encoding
                 return [1] * len(text)
 
-        vulnerable, _, _ = detect_from_tokenization_behavior(ShortTokenizer())
-        # Should not crash; no tests can be performed since lengths match
-        assert vulnerable is False
+        result = detect_from_tokenization_behavior(ShortTokenizer())
+        # Should not crash; tests were run but all matched
+        assert result["shifted"] == 0
+        assert result["fragility"] == 0.0
 
     def test_error_in_tokenization_is_handled(self) -> None:
         """When tokenizer.encode raises, return gracefully."""
@@ -189,10 +196,10 @@ class TestTokenizationBehavior:
             def encode(self, text, add_special_tokens=False):
                 raise RuntimeError("tokenizer crash")
 
-        vulnerable, fragility, detail = detect_from_tokenization_behavior(BrokenTokenizer())
-        assert vulnerable is False
-        assert fragility == 0.0
-        assert "error" in detail.lower()
+        result = detect_from_tokenization_behavior(BrokenTokenizer())
+        assert result["shifted"] == 0
+        assert result["fragility"] == 0.0
+        assert "error" in result["detail"].lower()
 
 
 class TestSentencePieceResolution:

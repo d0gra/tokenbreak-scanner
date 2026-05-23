@@ -1239,10 +1239,10 @@
       <section id="how-it-works">
         <div class="fade-in">
           <div class="section-label">Architecture</div>
-          <h2>6-Signal Weighted Detection</h2>
+          <h2>5-Signal Structural Detection</h2>
           <p class="section-desc">
-            TokenBreak Scanner doesn't rely on a lookup table. It runs a multi-signal weighted analysis
-            across orthogonal detection channels and uses a majority vote for high-confidence results.
+            Algorithm and risk are determined solely from structural metadata — never from empirical behavior probes.
+            A weighted majority vote across orthogonal detection channels gives high-confidence results.
           </p>
         </div>
 
@@ -1560,7 +1560,7 @@ report = inspect_model(<span class="code-yellow">"./my-model/"</span>)
       { type: 'prompt', text: '$ tokenbreak-scan Qwen/Qwen3-0.6B --download' },
       { type: 'info', text: '' },
       { type: 'info', text: '  Downloading tokenizer artifacts...' },
-      { type: 'info', text: '  Analyzing 6 detection signals...' },
+      { type: 'info', text: '  Analyzing 5 structural detection signals...' },
       { type: 'info', text: '' },
       { type: 'header', text: '  ══════════════════════════════════════════════' },
       { type: 'header', text: '           TOKENBREAK SCANNER REPORT' },
