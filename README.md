@@ -348,6 +348,33 @@ All contributions must comply with AGPL-3.0-or-later.
 
 See [LICENSE](LICENSE) or <https://www.gnu.org/licenses/agpl-3.0.html>.
 
+## Frequently Asked Questions
+
+### What is TokenBreak?
+TokenBreak is a tokenization-bound adversarial attack against BPE and WordPiece tokenizers. By prepending a single character to high-saliency words, an attacker forces the tokenizer to produce an entirely different token sequence — bypassing classifiers while preserving semantic meaning.
+
+### Is my model vulnerable?
+If your model uses **BPE** or **WordPiece** tokenization (GPT, LLaMA, Mistral, Qwen, BERT, etc.), it is vulnerable. If it uses **Unigram** tokenization (DeBERTa-v3, XLM-RoBERTa, T5), it is resistant.
+
+### How is TokenBreak Scanner different from prompt injection detection?
+Prompt injection detection monitors runtime prompts for adversarial intent. TokenBreak Scanner identifies a **structural vulnerability at the tokenizer level** — it tells you whether your model's tokenization algorithm makes it inherently exploitable, regardless of prompt content.
+
+### Does this require model weights or a GPU?
+No. TokenBreak Scanner analyzes tokenizer configuration files only (`config.json`, `tokenizer.json`, `tokenizer_config.json`). No weights download, no GPU, no PyTorch required for the base scan.
+
+### How do I integrate this into CI/CD?
+Use the `--output json` flag and check exit codes: `0` = safe, `1` = vulnerable, `2` = error. See the [CI Integration](#ci-integration) section for GitHub Actions and Airflow examples.
+
+## Related Work
+
+TokenBreak Scanner specializes in **tokenizer-level vulnerability detection** via static artifact analysis. It complements broader AI security and model evaluation tools:
+
+- **[Giskard](https://github.com/Giskard-AI/giskard)** — Open-source AI quality testing framework for model bias, robustness, and drift detection. Giskard focuses on holistic model quality and fairness; TokenBreak Scanner focuses specifically on tokenizer algorithm vulnerabilities that Giskard does not cover.
+- **[Adversarial Robustness Toolbox (ART)](https://github.com/Trusted-AI/adversarial-robustness-toolbox)** — IBM's comprehensive toolkit for adversarial attack and defense. ART covers evasion, poisoning, and extraction attacks at the model level; TokenBreak Scanner addresses a specific tokenizer architecture weakness upstream of the model.
+- **[OWASP Machine Learning Security Top 10](https://owasp.org/www-project-machine-learning-security-top-10/)** — Industry standard for ML security risks. TokenBreak falls under [ML01: Input Manipulation Attack](https://owasp.org/www-project-machine-learning-security-top-10/docs/ML01_2023-Input_Manipulation_Attack.html).
+
+For a comprehensive AI red-team or model audit pipeline, use TokenBreak Scanner **before** fine-tuning or deployment to validate tokenizer safety, then layer Giskard or ART for broader model-level robustness testing.
+
 ---
 
 ## References

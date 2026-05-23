@@ -137,6 +137,76 @@ class TestInspectModelLocal:
         assert report.risk_level == RiskLevel.UNKNOWN
 
 
+    def test_nested_text_config_model_type(self, tmp_path: Path) -> None:
+        """Multi-modal models with nested text_config should extract model_type."""
+        model_dir = tmp_path / "lance-like"
+        model_dir.mkdir()
+
+        config = {
+            "model_type": "lance",
+            "text_config": {
+                "model_type": "qwen2",
+                "_name_or_path": "Qwen/Qwen2-7B",
+            },
+        }
+        tokenizer_config = {"tokenizer_class": "Qwen2TokenizerFast"}
+        tokenizer_json = {"model": {"type": "BPE", "vocab": {}}}
+
+        (model_dir / "config.json").write_text(json.dumps(config))
+        (model_dir / "tokenizer_config.json").write_text(json.dumps(tokenizer_config))
+        (model_dir / "tokenizer.json").write_text(json.dumps(tokenizer_json))
+
+        report = inspect_model(str(model_dir))
+
+        # "lance" is still the primary model_type from config
+        assert report.model_type == "lance"
+        assert report.tokenizer_algorithm == TokenizerAlgorithm.BPE
+        assert report.vulnerable_to_tokenbreak is True
+
+    def test_config_only_model_graceful(self, tmp_path: Path) -> None:
+        """Models shipping only config.json (no tokenizer files) should not crash."""
+        model_dir = tmp_path / "config-only"
+        model_dir.mkdir()
+
+        config = {
+            "model_type": "some_vision_model",
+            "text_config": {
+                "model_type": "llama",
+                "_name_or_path": "meta-llama/Llama-2-7b",
+            },
+        }
+        (model_dir / "config.json").write_text(json.dumps(config))
+
+        report = inspect_model(str(model_dir))
+
+        # Should fall back to nested text_config model_type
+        # and at minimum not crash
+        assert report.model_type == "some_vision_model"
+
+    def test_nested_text_config_model_type_used_for_family(self, tmp_path: Path) -> None:
+        """When top-level model_type is unknown, nested model_type should inform detection."""
+        model_dir = tmp_path / "nested-fallback"
+        model_dir.mkdir()
+
+        config = {
+            "text_config": {
+                "model_type": "bert",
+            },
+        }
+        tokenizer_config = {"tokenizer_class": "BertTokenizerFast"}
+        tokenizer_json = {"model": {"type": "WordPiece", "vocab": {}}}
+
+        (model_dir / "config.json").write_text(json.dumps(config))
+        (model_dir / "tokenizer_config.json").write_text(json.dumps(tokenizer_config))
+        (model_dir / "tokenizer.json").write_text(json.dumps(tokenizer_json))
+
+        report = inspect_model(str(model_dir))
+
+        # When no top-level model_type, nested text_config.model_type is used
+        assert report.model_type == "bert"
+        assert report.tokenizer_algorithm == TokenizerAlgorithm.WORDPIECE
+
+
 class TestFileNotFound:
     def test_nonexistent_path_no_download(self) -> None:
         with pytest.raises(FileNotFoundError):

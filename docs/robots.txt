@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://d0gra.github.io/tokenbreak-scanner/sitemap.xml

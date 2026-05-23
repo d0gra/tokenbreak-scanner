@@ -46,6 +46,53 @@ SIGNAL_WEIGHTS: dict[str, float] = {
 }
 
 
+def _extract_model_type(config: dict[str, Any]) -> str:
+    """Extract model_type from config.json, including nested structures.
+
+    Multi-modal models (e.g. Lance, LLaVA) often nest their text encoder
+    config inside ``text_config``, ``language_config``, or similar keys.
+    This function checks those nested structures and also looks at
+    ``_name_or_path`` to infer the tokenizer's parent model.
+    """
+    # Direct model_type
+    model_type = config.get("model_type", "")
+    if model_type:
+        return model_type
+
+    # Check nested config keys common in vision-language models
+    for nested_key in ("text_config", "language_config", "llm_config", "text_encoder_config"):
+        nested = config.get(nested_key, {})
+        if isinstance(nested, dict):
+            nested_type = nested.get("model_type", "")
+            if nested_type:
+                return nested_type
+
+    return ""
+
+
+def _infer_tokenizer_source(config: dict[str, Any]) -> str | None:
+    """Try to infer a tokenizer source from config.json references.
+
+    Models like Lance reference a base text model in ``_name_or_path`` or
+    nested ``text_config._name_or_path``.  This can be used to load the
+    correct tokenizer when the model repo itself ships no tokenizer files.
+    """
+    # Check _name_or_path at top level
+    name_or_path = config.get("_name_or_path", "")
+    if name_or_path and "/" in name_or_path:
+        return name_or_path
+
+    # Check nested text/language config
+    for nested_key in ("text_config", "language_config", "llm_config"):
+        nested = config.get(nested_key, {})
+        if isinstance(nested, dict):
+            nested_path = nested.get("_name_or_path", "")
+            if nested_path and "/" in nested_path:
+                return nested_path
+
+    return None
+
+
 def _load_json(path: Path | str) -> dict[str, Any] | None:
     """Safely load a JSON file, returning None on any error."""
     try:
@@ -53,6 +100,44 @@ def _load_json(path: Path | str) -> dict[str, Any] | None:
             return json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def _is_valid_model_dir(path: Path) -> bool:
+    """Check if a directory looks like a real HF model dir vs metadata-only.
+
+    Subdirectories may use alternate config names like ``llm_config.json``
+    instead of ``config.json`` (e.g. bytedance-research/Lance).
+    """
+    config = _load_json(path / CONFIG_FILENAME)
+    if config is None:
+        # Some repos use llm_config.json / language_config.json / config.json
+        for alt in ("llm_config.json", "language_config.json", "text_config.json"):
+            config = _load_json(path / alt)
+            if config is not None:
+                break
+    if config is None:
+        return False
+    # Needs at least model_type OR auto_map OR tokenizer files
+    has_tokenizer = (path / TOKENIZER_JSON_FILENAME).exists() or (path / TOKENIZER_CONFIG_FILENAME).exists()
+    return bool(config.get("model_type") or config.get("auto_map") or has_tokenizer)
+
+
+def _find_best_model_subdirectory(resolved_dir: Path) -> Path | None:
+    """Scan subdirectories for actual model checkpoints when root is metadata-only.
+
+    Some repos (e.g. bytedance-research/Lance) contain multiple checkpoints
+    in subdirectories. We scan one level deep for directories that have a
+    real config.json with model_type / tokenizer artifacts and pick the first
+    that looks like a valid model dir.
+    """
+    candidates: list[Path] = []
+    for subdir in sorted(resolved_dir.iterdir()):
+        if subdir.is_dir() and _is_valid_model_dir(subdir):
+            candidates.append(subdir)
+    if candidates:
+        logger.info("Root config is metadata; using subdirectory: %s", candidates[0])
+        return candidates[0]
+    return None
 
 
 def _download_custom_tokenizer_files(source: str, resolved_dir: Path) -> None:
@@ -98,6 +183,100 @@ def _download_custom_tokenizer_files(source: str, resolved_dir: Path) -> None:
                 logger.debug("Could not download optional file '%s' for '%s'", filename, source)
 
 
+def _resolve_hf_subdirectory(source: str) -> str | None:
+    """Discover model checkpoint subdirectories in HF repos with metadata-only roots.
+
+    Some repos (e.g. bytedance-research/Lance) have a metadata-only config.json
+    at the root and actual model checkpoints in subdirectories.
+    Returns a subdirectory prefix like 'Lance_3B/' or None.
+    """
+    try:
+        from huggingface_hub import list_repo_files
+        files = list(list_repo_files(source))
+    except Exception:
+        logger.debug("Could not list repo files for '%s'", source)
+        return None
+
+    # Score each directory that contains model config artifacts
+    candidates: dict[str, int] = {}
+    for f in files:
+        parts = f.split("/")
+        if len(parts) < 2:
+            continue
+        # Use top-level subdirectory as the candidate
+        prefix = parts[0]
+        if prefix in (".", ".."):
+            continue
+
+        filename = parts[-1].lower()
+        if filename in ("config.json", "llm_config.json", "language_config.json"):
+            candidates.setdefault(prefix, 0)
+            candidates[prefix] += 5
+        elif filename in ("tokenizer.json", "tokenizer_config.json"):
+            candidates.setdefault(prefix, 0)
+            candidates[prefix] += 3
+
+    if not candidates:
+        return None
+
+    # Prefer LLM / text subdirectories over video / vision-only ones
+    def score_with_name(name: str) -> int:
+        base = candidates.get(name, 0)
+        lower = name.lower()
+        if "llm" in lower or "text" in lower or "language" in lower:
+            base += 4
+        if "video" in lower or "vision" in lower:
+            base -= 3
+        return base
+
+    best = max(candidates.keys(), key=score_with_name)
+    logger.info("HF repo has metadata root; using subdirectory for model files: %s", best)
+    return best
+
+
+def _copy_or_link_subdir_to_root(source: str, best_subdir: str, resolved_dir: Path) -> None:
+    """Re-arrange a metadata-root HF cache to look like a standard model dir.
+
+    Some repos (e.g. bytedance-research/Lance) store model files in
+    subdirectories (e.g. Lance_3B/) rather than the repo root.  We download
+    the key config/tokenizer files from the identified subdirectory, then
+    promote them to the cache root so the rest of inspector.py works
+    without further changes.
+    """
+    # First, make sure the subdirectory exists locally by downloading key files
+    files_to_fetch = [
+        f"{best_subdir}/llm_config.json",
+        f"{best_subdir}/language_config.json",
+        f"{best_subdir}/config.json",
+        f"{best_subdir}/tokenizer_config.json",
+        f"{best_subdir}/tokenizer.json",
+    ]
+    for filename in files_to_fetch:
+        try:
+            cached_file(source, filename, _raise_exceptions_for_missing_entries=False)
+        except Exception:
+            pass  # File may not exist in this subdir
+
+    subdir_path = resolved_dir / best_subdir
+    if not subdir_path.is_dir():
+        logger.debug("Subdir %s still not found locally after fetch", subdir_path)
+        return
+
+    for child in subdir_path.iterdir():
+        dest = resolved_dir / child.name
+        if dest.exists():
+            continue
+        try:
+            if child.is_symlink():
+                target = os.readlink(child)
+                os.symlink(target, dest)
+            elif child.is_file():
+                os.link(child, dest)
+            logger.debug("Promoted %s -> root", child.name)
+        except (OSError, FileExistsError):
+            pass
+
+
 def _resolve_model_path(source: str, *, download: bool = False) -> Path:
     """Resolve a model identifier to a local path.
 
@@ -130,6 +309,22 @@ def _resolve_model_path(source: str, *, download: bool = False) -> Path:
                 resolved_dir = Path(tokenizer_config_path).parent.resolve()
             elif tokenizer_json_path:
                 resolved_dir = Path(tokenizer_json_path).parent.resolve()
+
+            # Check if root is metadata-only; if so look for real model subdirectories
+            if resolved_dir is not None and not _is_valid_model_dir(resolved_dir):
+                sub = _find_best_model_subdirectory(resolved_dir)
+                if sub is not None:
+                    resolved_dir = sub
+                    logger.info("Root config is metadata-only; using subdirectory: %s", sub)
+                else:
+                    # Root is metadata-only and no local subdirectories exist.
+                    # Try to discover a subdirectory via HF Hub API.
+                    hf_sub = _resolve_hf_subdirectory(source)
+                    if hf_sub:
+                        _copy_or_link_subdir_to_root(source, hf_sub, resolved_dir)
+                        sub_path = _find_best_model_subdirectory(resolved_dir)
+                        if sub_path:
+                            resolved_dir = sub_path
 
             # Also download custom tokenizer Python files referenced in
             # config.json auto_map or tokenizer_config.json (e.g.
@@ -173,8 +368,16 @@ def inspect_model(
     tokenizer_config = _load_json(model_path / TOKENIZER_CONFIG_FILENAME) or {}
     tokenizer_json = _load_json(model_path / TOKENIZER_JSON_FILENAME)
 
-    # Extract model type
-    model_type = config.get("model_type", "")
+    # Some repos (e.g. Lance) ship config in alternate named files
+    if not config:
+        for alt_name in ("llm_config.json", "language_config.json", "text_config.json"):
+            alt_config = _load_json(model_path / alt_name)
+            if alt_config is not None:
+                config = alt_config
+                break
+
+    # Extract model type (handles nested configs for multi-modal models)
+    model_type = _extract_model_type(config)
     model_family = get_model_family(model_type)
 
     # ── Detection: collect signals, then aggregate ──
@@ -208,8 +411,9 @@ def inspect_model(
         vocab_size = len(loaded_tokenizer)
         tok_cls_name = loaded_tokenizer.__class__.__name__
     except Exception as exc:
-        logger.warning("Could not load tokenizer via AutoTokenizer: %s", exc)
-        # Fallback: load tokenizer.json directly via the tokenizers library.
+        logger.warning("Could not load tokenizer via AutoTokenizer (local): %s", exc)
+
+        # Fallback A: load tokenizer.json directly via the tokenizers library.
         # This handles custom architectures (e.g. Nandi) that don't ship
         # a tokenization_*.py file but DO have a valid tokenizer.json.
         tokenizer_json_path = model_path / TOKENIZER_JSON_FILENAME
@@ -238,6 +442,36 @@ def inspect_model(
                 logger.info("Recovered tokenizer info via direct tokenizer.json load: vocab=%s, type=%s", vocab_size, runtime_type)
             except Exception as fallback_exc:
                 logger.warning("Direct tokenizer.json fallback also failed: %s", fallback_exc)
+
+        # Fallback B: For models that store no tokenizer files at all (e.g.
+        # multi-modal models like Lance), try loading the tokenizer from the
+        # parent/base model referenced in config.json, or from the original
+        # HF source directly.
+        if loaded_tokenizer is None and vocab_size is None:
+            # Try inferring tokenizer source from config references
+            inferred_source = _infer_tokenizer_source(config)
+            fallback_sources_to_try = []
+            if inferred_source:
+                fallback_sources_to_try.append(inferred_source)
+            # Also try the original source if it looks like an HF model ID
+            if not Path(source).is_dir() and "/" in source:
+                fallback_sources_to_try.append(source)
+
+            for fb_source in fallback_sources_to_try:
+                try:
+                    loaded_tokenizer = AutoTokenizer.from_pretrained(
+                        fb_source,
+                        trust_remote_code=trust_remote_code,
+                    )
+                    vocab_size = len(loaded_tokenizer)
+                    tok_cls_name = loaded_tokenizer.__class__.__name__
+                    logger.info(
+                        "Loaded tokenizer from fallback source '%s': class=%s, vocab=%s",
+                        fb_source, tok_cls_name, vocab_size,
+                    )
+                    break
+                except Exception as fb_exc:
+                    logger.debug("Fallback tokenizer load from '%s' failed: %s", fb_source, fb_exc)
 
     if loaded_tokenizer is not None:
         algo, reason = detect_from_runtime_tokenizer(loaded_tokenizer)
