@@ -7,11 +7,13 @@ from tokenbreak_scanner.tokenizers import (
     MODEL_FAMILY_MAP,
     MODEL_TYPE_MAP,
     TOKENIZER_CLASS_MAP,
+    detect_from_tokenization_behavior,
     detect_tokenizer_from_config,
     detect_tokenizer_from_json,
     get_model_family,
     get_recommendation,
     is_vulnerable,
+    resolve_sentencepiece_algorithm,
 )
 
 
@@ -114,3 +116,92 @@ class TestMapCompleteness:
             assert model_type in MODEL_FAMILY_MAP or model_type.replace("-", "_") in [
                 k.replace("-", "_") for k in MODEL_FAMILY_MAP
             ]
+
+    def test_no_duplicate_keys_in_tokenizer_class_map(self) -> None:
+        """Verify TOKENIZER_CLASS_MAP has no duplicate keys."""
+        # Python dicts can't have duplicate keys, but we can verify
+        # that the mapping is consistent (no BPE mapped tokenizer also
+        # appearing in the Unigram section, etc.)
+        bpe_keys = {k for k, v in TOKENIZER_CLASS_MAP.items() if v == TokenizerAlgorithm.BPE}
+        wp_keys = {k for k, v in TOKENIZER_CLASS_MAP.items() if v == TokenizerAlgorithm.WORDPIECE}
+        unigram_keys = {k for k, v in TOKENIZER_CLASS_MAP.items() if v == TokenizerAlgorithm.UNIGRAM}
+        sp_keys = {k for k, v in TOKENIZER_CLASS_MAP.items() if v == TokenizerAlgorithm.SENTENCEPIECE}
+        # No tokenizer should be in multiple categories
+        assert not (bpe_keys & wp_keys), f"BPE+WordPiece overlap: {bpe_keys & wp_keys}"
+        assert not (bpe_keys & unigram_keys), f"BPE+Unigram overlap: {bpe_keys & unigram_keys}"
+        assert not (wp_keys & unigram_keys), f"WordPiece+Unigram overlap: {wp_keys & unigram_keys}"
+
+
+class TestTokenizationBehavior:
+    """Test the ground-truth tokenization behavior detection."""
+
+    def test_none_tokenizer_returns_false(self) -> None:
+        """None tokenizer should return not-vulnerable."""
+        vulnerable, fragility, detail = detect_from_tokenization_behavior(None)
+        assert vulnerable is False
+        assert fragility == 0.0
+        assert "No tokenizer" in detail
+
+    def test_mock_tokenizer_encoding(self) -> None:
+        """Test with a mock tokenizer that simulates BPE behavior."""
+        class MockTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                # Simulate BPE: prepend changes tokenization
+                if text.startswith("Xpassword"):
+                    return [100, 200, 300, 400, 500]  # Different tokens!
+                if text.startswith("password"):
+                    return [200, 300, 400, 500]
+                # All other words: no shift
+                return [42] * len(text)
+
+        vulnerable, fragility, detail = detect_from_tokenization_behavior(MockTokenizer())
+        assert vulnerable is True
+        assert fragility > 0.0
+        assert "password" in detail
+
+    def test_mock_unigram_tokenizer(self) -> None:
+        """Test with a mock tokenizer that simulates Unigram behavior (resistant)."""
+        class MockUnigramTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                # Simulate Unigram: prepend doesn't change word tokenization
+                tokens = [hash(c) % 1000 + 1000 for c in text]
+                return tokens
+
+        vulnerable, fragility, detail = detect_from_tokenization_behavior(MockUnigramTokenizer())
+        assert vulnerable is False
+        assert fragility == 0.0
+        assert "resistant" in detail
+
+    def test_short_perturbed_sequence_skipped(self) -> None:
+        """When perturbed sequence is same length or shorter, skip test."""
+        class ShortTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                # Always return same-length encoding
+                return [1] * len(text)
+
+        vulnerable, _, _ = detect_from_tokenization_behavior(ShortTokenizer())
+        # Should not crash; no tests can be performed since lengths match
+        assert vulnerable is False
+
+    def test_error_in_tokenization_is_handled(self) -> None:
+        """When tokenizer.encode raises, return gracefully."""
+        class BrokenTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                raise RuntimeError("tokenizer crash")
+
+        vulnerable, fragility, detail = detect_from_tokenization_behavior(BrokenTokenizer())
+        assert vulnerable is False
+        assert fragility == 0.0
+        assert "error" in detail.lower()
+
+
+class TestSentencePieceResolution:
+    """Test SentencePiece ambiguity resolution."""
+
+    def test_no_model_file_returns_none(self, tmp_path) -> None:
+        """When no .model file exists, return None."""
+        import pathlib
+        model_dir = pathlib.Path(tmp_path) / "no-sp-model"
+        model_dir.mkdir()
+        result = resolve_sentencepiece_algorithm(model_dir)
+        assert result is None

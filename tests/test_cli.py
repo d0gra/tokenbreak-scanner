@@ -22,6 +22,11 @@ def _mock_heavy_deps():
             "tokenbreak_scanner.inspector.detect_from_remote_source",
             return_value=(None, ""),
         ),
+        # Mock the ground-truth tokenization test since no real tokenizer
+        patch(
+            "tokenbreak_scanner.inspector.detect_from_tokenization_behavior",
+            return_value=(False, 0.0, "mocked: no tokenizer available"),
+        ),
     ):
         yield
 
@@ -82,3 +87,35 @@ class TestCliOutput:
         result = runner.invoke(main, ["--version"])
         assert result.exit_code == 0
         assert __version__ in result.output
+
+    def test_batch_mode_no_dirs(self, tmp_path: Path) -> None:
+        """Batch mode with no model directories exits gracefully."""
+        empty_dir = tmp_path / "empty"
+        empty_dir.mkdir()
+
+        runner = CliRunner()
+        result = runner.invoke(main, [str(empty_dir), "--batch"])
+        assert result.exit_code == 0
+        assert "No model directories found" in result.output
+
+    def test_batch_mode_with_models(self, tmp_path: Path) -> None:
+        """Batch mode scans all model subdirectories."""
+        for name, model_type in [("roberta-a", "roberta"), ("deberta-b", "deberta-v2")]:
+            md = tmp_path / name
+            md.mkdir()
+            (md / "config.json").write_text(f'{{"model_type": "{model_type}"}}')
+            (md / "tokenizer_config.json").write_text(
+                '{"tokenizer_class": "RobertaTokenizerFast"}'
+                if model_type == "roberta" else '{"tokenizer_class": "DebertaV2Tokenizer"}'
+            )
+            (md / "tokenizer.json").write_text(
+                '{"model": {"type": "BPE"}}'
+                if model_type == "roberta" else '{"model": {"type": "Unigram"}}'
+            )
+
+        runner = CliRunner()
+        result = runner.invoke(main, [str(tmp_path), "--batch"])
+
+        assert result.exit_code == 1  # at least one vulnerable
+        assert "VULN" in result.output
+        assert "SAFE" in result.output

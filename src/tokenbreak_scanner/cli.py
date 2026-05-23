@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
+from pathlib import Path
 from typing import Optional
 
 import click
@@ -18,6 +20,13 @@ from .models import RiskLevel, ScannerReport
 from .validator import AttackValidationResult, validate_attack
 
 console = Console(stderr=True)
+
+
+def _fragility_bar(fragility: float, width: int = 20) -> str:
+    """Render a mini progress bar for fragility score."""
+    filled = int(fragility * width)
+    bar = "█" * filled + "░" * (width - filled)
+    return f"[{bar}] {fragility:.2f}"
 
 
 def _build_table(report: ScannerReport) -> Table:
@@ -46,6 +55,12 @@ def _build_table(report: ScannerReport) -> Table:
     )
     table.add_row("Risk Level", Text(report.risk_level.value, style=f"bold {risk_color}"))
     table.add_row("Source", report.source)
+
+    # Fragility score (ground-truth test result)
+    fragility = report.config_metadata.get("fragility_score", None)
+    if fragility is not None and isinstance(fragility, (int, float)) and fragility > 0:
+        table.add_row("Token Fragility", _fragility_bar(float(fragility)))
+
     table.add_row("Recommendation", report.recommendation)
 
     # Evidence tree
@@ -62,13 +77,31 @@ def _build_table(report: ScannerReport) -> Table:
     return table
 
 
-def _print_json(report: ScannerReport, attack_result: Optional[AttackValidationResult] = None) -> None:
-    """Print report as JSON.
+def _build_batch_summary_table(reports: list[ScannerReport]) -> Table:
+    """Build a summary table for batch scan results."""
+    table = Table(title="TokenBreak Batch Scan Summary")
+    table.add_column("Model", style="cyan", no_wrap=True)
+    table.add_column("Algorithm", style="white")
+    table.add_column("Vulnerable", style="white")
+    table.add_column("Confidence", style="white")
+    table.add_column("Fragility", style="white")
 
-    Excludes ``config_metadata`` and ``tokenizer_metadata`` which contain
-    raw artifact contents (including the full vocab) and would make CI/CD
-    output unusably large.
-    """
+    for report in reports:
+        vuln_text = Text("YES", style="bold red") if report.vulnerable_to_tokenbreak else Text("NO", style="bold green")
+        fragility = report.config_metadata.get("fragility_score", None)
+        fragility_str = f"{fragility:.2f}" if isinstance(fragility, (int, float)) else "N/A"
+        table.add_row(
+            report.model_name,
+            report.tokenizer_algorithm.value,
+            vuln_text,
+            f"{report.confidence_score:.2f}",
+            fragility_str,
+        )
+    return table
+
+
+def _print_json(report: ScannerReport, attack_result: Optional[AttackValidationResult] = None) -> None:
+    """Print report as JSON."""
     data = report.model_dump(mode="json", exclude={"config_metadata", "tokenizer_metadata"})
     if attack_result is not None:
         data["attack_validation"] = attack_result.model_dump(mode="json")
@@ -112,6 +145,76 @@ def _print_table(report: ScannerReport, attack_result: Optional[AttackValidation
     click.echo()
 
 
+def _scan_one(
+    source: str,
+    download: bool,
+    trust_remote_code: bool,
+    test_attack: bool,
+    threshold: float,
+    output_format: str,
+) -> int:
+    """Scan a single model and return exit code."""
+    try:
+        report = inspect_model(
+            source,
+            download=download,
+            trust_remote_code=trust_remote_code,
+        )
+    except FileNotFoundError as exc:
+        console.print(f"[bold red]Error:[/bold red] {exc}")
+        return 2
+    except Exception as exc:
+        console.print(f"[bold red]Unexpected error during inspection:[/bold red] {exc}")
+        return 2
+
+    attack_result: Optional[AttackValidationResult] = None
+    if test_attack:
+        if report.vulnerable_to_tokenbreak:
+            try:
+                attack_result = validate_attack(
+                    source,
+                    threshold=threshold,
+                    download=download,
+                    trust_remote_code=trust_remote_code,
+                )
+            except Exception as exc:
+                console.print(f"[bold yellow]Warning:[/bold yellow] Attack validation failed: {exc}")
+        else:
+            console.print(
+                "[bold yellow]Skipping attack test:[/bold yellow] "
+                "Model is not flagged as vulnerable (Unigram tokenizer detected)."
+            )
+
+    if output_format == "json":
+        _print_json(report, attack_result)
+    else:
+        _print_table(report, attack_result)
+
+    if report.risk_level == RiskLevel.HIGH:
+        return 1
+    return 0
+
+
+def _discover_model_dirs(root: Path) -> list[Path]:
+    """Discover model directories under a root path.
+
+    A directory is considered a model dir if it contains at least one of:
+    config.json, tokenizer.json, tokenizer_config.json, or safetensors files.
+    """
+    model_dirs: list[Path] = []
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir():
+            continue
+        has_config = (entry / "config.json").exists()
+        has_tokenizer_json = (entry / "tokenizer.json").exists()
+        has_tokenizer_config = (entry / "tokenizer_config.json").exists()
+        has_safetensors = any(entry.glob("*.safetensors"))
+        has_gguf = any(entry.glob("*.gguf"))
+        if has_config or has_tokenizer_json or has_tokenizer_config or has_safetensors or has_gguf:
+            model_dirs.append(entry)
+    return model_dirs
+
+
 @click.command(name="tokenbreak-scan")
 @click.argument("source")
 @click.option(
@@ -132,7 +235,7 @@ def _print_table(report: ScannerReport, attack_result: Optional[AttackValidation
     "--trust-remote-code",
     is_flag=True,
     default=False,
-    help="Trust remote code when loading tokenizers.",
+    help="Trust remote code when loading tokenizers. WARNING: executes arbitrary code.",
 )
 @click.option(
     "--test-attack",
@@ -148,6 +251,18 @@ def _print_table(report: ScannerReport, attack_result: Optional[AttackValidation
     show_default=True,
     help="Confidence threshold for TokenBreak attack validation.",
 )
+@click.option(
+    "--hf-token",
+    default=None,
+    envvar="HF_TOKEN",
+    help="HuggingFace API token for gated/private models. Also read from HF_TOKEN env var.",
+)
+@click.option(
+    "--batch",
+    is_flag=True,
+    default=False,
+    help="Treat SOURCE as a directory and scan all model subdirectories within it.",
+)
 @click.version_option(version=__version__)
 def main(
     source: str,
@@ -156,54 +271,66 @@ def main(
     trust_remote_code: bool,
     test_attack: bool,
     threshold: float,
+    hf_token: Optional[str],
+    batch: bool,
 ) -> None:
     """Scan MODEL_PATH_OR_ID for TokenBreak tokenizer vulnerabilities.
 
     SOURCE can be a local directory containing model files
     (config.json, tokenizer.json, etc.) or a HuggingFace / custom model ID.
-    """
-    try:
-        report = inspect_model(
-            source,
-            download=download,
-            trust_remote_code=trust_remote_code,
-        )
-    except FileNotFoundError as exc:
-        console.print(f"[bold red]Error:[/bold red] {exc}")
-        sys.exit(2)
-    except Exception as exc:
-        console.print(f"[bold red]Unexpected error during inspection:[/bold red] {exc}")
-        sys.exit(2)
 
-    attack_result: Optional[AttackValidationResult] = None
-    if test_attack:
-        if report.vulnerable_to_tokenbreak:
+    Use --batch to scan all model directories under SOURCE.
+
+    Use --hf-token (or set HF_TOKEN env var) for gated/private models.
+    """
+    # Set HF token for gated model access
+    if hf_token:
+        os.environ["HF_TOKEN"] = hf_token
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_token
+
+    # Batch scan mode
+    if batch:
+        root = Path(source)
+        if not root.is_dir():
+            console.print(f"[bold red]Error:[/bold red] --batch requires a directory: '{source}'")
+            sys.exit(2)
+
+        model_dirs = _discover_model_dirs(root)
+        if not model_dirs:
+            console.print(f"[bold yellow]No model directories found under: {source}[/bold yellow]")
+            sys.exit(0)
+
+        console.print(f"[bold]Scanning {len(model_dirs)} model(s) under {source}...[/bold]\n")
+
+        reports: list[ScannerReport] = []
+        had_error = False
+        for md in model_dirs:
             try:
-                attack_result = validate_attack(
-                    source,
-                    threshold=threshold,
-                    download=download,
-                    trust_remote_code=trust_remote_code,
+                report = inspect_model(str(md), download=download, trust_remote_code=trust_remote_code)
+                reports.append(report)
+                console.print(
+                    f"  {md.name:40s} "
+                    f"{'[red]VULN[/red]' if report.vulnerable_to_tokenbreak else '[green]SAFE[/green]'} "
+                    f"({report.tokenizer_algorithm.value}, conf={report.confidence_score:.2f})"
                 )
             except Exception as exc:
-                console.print(
-                    f"[bold yellow]Warning:[/bold yellow] Attack validation failed: {exc}"
-                )
-        else:
-            console.print(
-                "[bold yellow]Skipping attack test:[/bold yellow] "
-                "Model is not flagged as vulnerable (Unigram tokenizer detected)."
-            )
+                console.print(f"  [bold red]ERROR[/bold red] {md.name}: {exc}")
+                had_error = True
 
-    if output_format == "json":
-        _print_json(report, attack_result)
-    else:
-        _print_table(report, attack_result)
+        click.echo()
+        if reports:
+            console.print(_build_batch_summary_table(reports))
 
-    # Exit codes for CI pipelines
-    if report.risk_level == RiskLevel.HIGH:
-        sys.exit(1)
-    sys.exit(0)
+        # Exit code: 1 if any model vulnerable, 2 if any error, 0 if all safe
+        if had_error:
+            sys.exit(2)
+        if any(r.vulnerable_to_tokenbreak for r in reports):
+            sys.exit(1)
+        sys.exit(0)
+
+    # Single model scan
+    exit_code = _scan_one(source, download, trust_remote_code, test_attack, threshold, output_format)
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

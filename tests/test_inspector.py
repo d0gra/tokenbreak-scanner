@@ -22,6 +22,10 @@ def _mock_heavy_deps():
             "tokenbreak_scanner.inspector.detect_from_remote_source",
             return_value=(None, ""),
         ),
+        patch(
+            "tokenbreak_scanner.inspector.detect_from_tokenization_behavior",
+            return_value=(False, 0.0, "mocked: no tokenizer available"),
+        ),
     ):
         yield
 
@@ -211,3 +215,92 @@ class TestFileNotFound:
     def test_nonexistent_path_no_download(self) -> None:
         with pytest.raises(FileNotFoundError):
             inspect_model("/definitely/does/not/exist", download=False)
+
+
+class TestDecisionTree:
+    """Test the new decision-tree-based algorithm selection."""
+
+    def test_tokenizer_json_wins_over_config(self, tmp_path: Path) -> None:
+        """tokenizer.json should take priority over config.json model_type."""
+        model_dir = tmp_path / "conflict-model"
+        model_dir.mkdir()
+
+        # config.json says BERT (WordPiece), but tokenizer.json says BPE
+        config = {"model_type": "bert"}
+        tokenizer_config = {"tokenizer_class": "BertTokenizerFast"}
+        tokenizer_json = {"model": {"type": "BPE"}}  # Override!
+
+        (model_dir / "config.json").write_text(json.dumps(config))
+        (model_dir / "tokenizer_config.json").write_text(json.dumps(tokenizer_config))
+        (model_dir / "tokenizer.json").write_text(json.dumps(tokenizer_json))
+
+        report = inspect_model(str(model_dir))
+
+        # tokenizer.json wins → BPE
+        assert report.tokenizer_algorithm == TokenizerAlgorithm.BPE
+        assert report.vulnerable_to_tokenbreak is True
+        # Confidence should be high but not 0.98 (no ground-truth test)
+        assert report.confidence_score >= 0.70
+
+    def test_no_tokenizer_json_falls_back_to_runtime(self, tmp_path: Path) -> None:
+        """Without tokenizer.json, config signals determine algorithm."""
+        model_dir = tmp_path / "runtime-fallback"
+        model_dir.mkdir()
+
+        config = {"model_type": "roberta"}
+        tokenizer_config = {"tokenizer_class": "RobertaTokenizerFast"}
+        # No tokenizer.json
+
+        (model_dir / "config.json").write_text(json.dumps(config))
+        (model_dir / "tokenizer_config.json").write_text(json.dumps(tokenizer_config))
+
+        report = inspect_model(str(model_dir))
+
+        assert report.tokenizer_algorithm == TokenizerAlgorithm.BPE
+        assert report.vulnerable_to_tokenbreak is True
+
+    def test_confidence_drops_with_conflicting_signals(self, tmp_path: Path) -> None:
+        """When metadata signals disagree, confidence should be lower."""
+        model_dir = tmp_path / "messy-model"
+        model_dir.mkdir()
+
+        # Deliberately conflicting: model_type=BERT but tokenizer class=RobertaTokenizer
+        config = {"model_type": "bert"}
+        tokenizer_config = {"tokenizer_class": "RobertaTokenizerFast"}
+        # No tokenizer.json
+
+        (model_dir / "config.json").write_text(json.dumps(config))
+        (model_dir / "tokenizer_config.json").write_text(json.dumps(tokenizer_config))
+
+        report = inspect_model(str(model_dir))
+
+        # With conflicting signals and no tokenizer.json, confidence should be moderate
+        assert report.confidence_score < 0.90
+
+
+class TestConfidenceModel:
+    """Test the new confidence scoring."""
+
+    def test_tokenizer_json_only_high_confidence(self, tmp_path: Path) -> None:
+        """tokenizer.json alone should give high confidence."""
+        model_dir = tmp_path / "json-only"
+        model_dir.mkdir()
+
+        tokenizer_json = {"model": {"type": "BPE", "vocab": {}}}
+        (model_dir / "tokenizer.json").write_text(json.dumps(tokenizer_json))
+
+        report = inspect_model(str(model_dir))
+
+        assert report.tokenizer_algorithm == TokenizerAlgorithm.BPE
+        assert report.confidence_score >= 0.85
+
+    def test_empty_dir_low_confidence(self, tmp_path: Path) -> None:
+        """Empty directory should have very low confidence."""
+        model_dir = tmp_path / "empty-conf"
+        model_dir.mkdir()
+
+        report = inspect_model(str(model_dir))
+
+        assert report.tokenizer_algorithm == TokenizerAlgorithm.UNKNOWN
+        assert report.confidence_score <= 0.20
+        assert report.risk_level == RiskLevel.UNKNOWN

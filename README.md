@@ -10,7 +10,7 @@ The open-source tokenizer audit tool for AI developers. Scan any HuggingFace or 
 [![CI Tests](https://github.com/d0gra/tokenbreak-scanner/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/d0gra/tokenbreak-scanner/actions/workflows/ci.yml)
 [![PyPI Downloads](https://img.shields.io/pypi/dm/tokenbreak-scanner?color=green)](https://pypi.org/project/tokenbreak-scanner)
 
-[📄 Research Paper](https://arxiv.org/html/2506.07948v1) · [⚡ Quick Start](#quick-start) · [🔧 Use Cases](#when-to-use-tokenbreak-scanner) · [CI Integration](#ci-integration) · [Architecture](#architecture)
+[📄 Research Paper](https://arxiv.org/html/2506.07948v1) · [🌐 Documentation & Blog](https://d0gra.github.io/tokenbreak-scanner/) · [⚡ Quick Start](#quick-start) · [🔧 Use Cases](#when-to-use-tokenbreak-scanner) · [CI Integration](#ci-integration) · [Architecture](#architecture)
 
 ---
 

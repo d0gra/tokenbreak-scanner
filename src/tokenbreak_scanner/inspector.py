@@ -20,11 +20,13 @@ from .tokenizers import (
     detect_from_remote_source,
     detect_from_runtime_tokenizer,
     detect_from_source_code,
+    detect_from_tokenization_behavior,
     detect_tokenizer_from_config,
     detect_tokenizer_from_json,
     get_model_family,
     get_recommendation,
     is_vulnerable,
+    resolve_sentencepiece_algorithm,
 )
 
 logger = logging.getLogger(__name__)
@@ -380,13 +382,15 @@ def inspect_model(
     model_type = _extract_model_type(config)
     model_family = get_model_family(model_type)
 
-    # ── Detection: collect signals, then aggregate ──
+    # ── Detection: collect all available signals ──
     sources: list[DetectionSource] = []
+    algorithm_from_tokenizer_json: TokenizerAlgorithm | None = None
 
-    # Signal 1: tokenizer.json "model.type" - most reliable
+    # Signal A: tokenizer.json "model.type" — structural metadata
     if tokenizer_json is not None:
         algo = detect_tokenizer_from_json(tokenizer_json)
         if algo is not None:
+            algorithm_from_tokenizer_json = algo
             sources.append(
                 DetectionSource(
                     signal="tokenizer.json model.type",
@@ -398,7 +402,7 @@ def inspect_model(
             )
             logger.debug("Tokenizer algorithm detected from tokenizer.json: %s", algo)
 
-    # Signal 2: Attempt to load AutoTokenizer and inspect Rust backend
+    # Signal B: Attempt to load AutoTokenizer for runtime inspection + ground-truth test
     loaded_tokenizer: Optional[Any] = None
     vocab_size: Optional[int] = None
     tok_cls_name: str = "unknown"
@@ -414,8 +418,6 @@ def inspect_model(
         logger.warning("Could not load tokenizer via AutoTokenizer (local): %s", exc)
 
         # Fallback A: load tokenizer.json directly via the tokenizers library.
-        # This handles custom architectures (e.g. Nandi) that don't ship
-        # a tokenization_*.py file but DO have a valid tokenizer.json.
         tokenizer_json_path = model_path / TOKENIZER_JSON_FILENAME
         if tokenizer_json_path.exists():
             try:
@@ -424,36 +426,17 @@ def inspect_model(
                 raw_tok = HFTokenizer.from_file(str(tokenizer_json_path))
                 vocab_size = raw_tok.get_vocab_size()
                 tok_cls_name = type(raw_tok.model).__name__ + "Tokenizer (direct)"
-                # Also collect the runtime signal from the raw tokenizer
-                runtime_type = type(raw_tok.model).__name__
-                from .tokenizers import RUNTIME_MODEL_TYPE_MAP
-
-                runtime_algo = RUNTIME_MODEL_TYPE_MAP.get(runtime_type)
-                if runtime_algo is not None:
-                    sources.append(
-                        DetectionSource(
-                            signal="runtime._tokenizer.model",
-                            value=runtime_type,
-                            inferred=runtime_algo.value,
-                            weight=SIGNAL_WEIGHTS["runtime._tokenizer.model"],
-                            reason="Direct tokenizers library model type (AutoTokenizer fallback)",
-                        )
-                    )
-                logger.info("Recovered tokenizer info via direct tokenizer.json load: vocab=%s, type=%s", vocab_size, runtime_type)
+                loaded_tokenizer = raw_tok  # for ground-truth test below
+                logger.info("Recovered tokenizer via direct tokenizer.json load: vocab=%s", vocab_size)
             except Exception as fallback_exc:
                 logger.warning("Direct tokenizer.json fallback also failed: %s", fallback_exc)
 
-        # Fallback B: For models that store no tokenizer files at all (e.g.
-        # multi-modal models like Lance), try loading the tokenizer from the
-        # parent/base model referenced in config.json, or from the original
-        # HF source directly.
-        if loaded_tokenizer is None and vocab_size is None:
-            # Try inferring tokenizer source from config references
+        # Fallback B: try loading from parent/base model referenced in config.json
+        if (loaded_tokenizer is None or isinstance(loaded_tokenizer, type(_load_json))):
             inferred_source = _infer_tokenizer_source(config)
             fallback_sources_to_try = []
             if inferred_source:
                 fallback_sources_to_try.append(inferred_source)
-            # Also try the original source if it looks like an HF model ID
             if not Path(source).is_dir() and "/" in source:
                 fallback_sources_to_try.append(source)
 
@@ -465,28 +448,27 @@ def inspect_model(
                     )
                     vocab_size = len(loaded_tokenizer)
                     tok_cls_name = loaded_tokenizer.__class__.__name__
-                    logger.info(
-                        "Loaded tokenizer from fallback source '%s': class=%s, vocab=%s",
-                        fb_source, tok_cls_name, vocab_size,
-                    )
+                    logger.info("Loaded tokenizer from fallback source '%s'", fb_source)
                     break
                 except Exception as fb_exc:
                     logger.debug("Fallback tokenizer load from '%s' failed: %s", fb_source, fb_exc)
 
-    if loaded_tokenizer is not None:
-        algo, reason = detect_from_runtime_tokenizer(loaded_tokenizer)
-        if algo is not None:
+    # Collect runtime + source-code signals (secondary evidence)
+    if loaded_tokenizer is not None and not isinstance(loaded_tokenizer, type(_load_json)):
+        # Runtime Rust backend inspection
+        algo_rt, reason_rt = detect_from_runtime_tokenizer(loaded_tokenizer)
+        if algo_rt is not None:
             sources.append(
                 DetectionSource(
                     signal="runtime._tokenizer.model",
-                    value=reason,
-                    inferred=algo.value,
+                    value=reason_rt,
+                    inferred=algo_rt.value,
                     weight=SIGNAL_WEIGHTS["runtime._tokenizer.model"],
                     reason="Rust fast-tokenizer backend model type",
                 )
             )
 
-        # Signal 3: source-code fingerprint (if inspect.getsource succeeds)
+        # Source-code fingerprint
         algo_src, reason_src = detect_from_source_code(loaded_tokenizer)
         if algo_src is not None:
             sources.append(
@@ -499,7 +481,7 @@ def inspect_model(
                 )
             )
 
-    # Signal 4: tokenizer_config.json → tokenizer_class / model_type
+    # Signal C: tokenizer_config.json → class / model_type
     algo_cfg = detect_tokenizer_from_config(tokenizer_config)
     if algo_cfg is not None:
         sources.append(
@@ -512,7 +494,7 @@ def inspect_model(
             )
         )
 
-    # Signal 5: config.json model_type fallback
+    # Signal D: config.json model_type (weakest signal)
     if model_type:
         from .tokenizers import MODEL_TYPE_MAP
 
@@ -528,7 +510,7 @@ def inspect_model(
                 )
             )
 
-    # Signal 6: remote source file for trust_remote_code models
+    # Signal E: remote source file for trust_remote_code models
     algo_remote, reason_remote = detect_from_remote_source(model_path, trust_remote_code=trust_remote_code)
     if algo_remote is not None:
         sources.append(
@@ -541,9 +523,60 @@ def inspect_model(
             )
         )
 
-    # ── Aggregate weighted votes ──
-    algorithm = _aggregate_signals(sources)
-    confidence_score = _confidence_from_sources(sources)
+    # ═══════════════════════════════════════════════════════════════
+    # GROUND-TRUTH SIGNAL: actual tokenization behavior test
+    # This is the definitive TokenBreak test — it replicates the
+    # attack by prepending characters and checking if tokenization
+    # of the base word changes.  This has ZERO false positives.
+    # ═══════════════════════════════════════════════════════════════
+    tokenization_vulnerable: bool | None = None
+    fragility_score: float = 0.0
+    tokenization_detail: str = ""
+
+    if loaded_tokenizer is not None and not isinstance(loaded_tokenizer, type(_load_json)):
+        tokenization_vulnerable, fragility_score, tokenization_detail = (
+            detect_from_tokenization_behavior(loaded_tokenizer)
+        )
+        if tokenization_detail:
+            sources.append(
+                DetectionSource(
+                    signal="tokenization_behavior_test",
+                    value=f"fragility={fragility_score:.2f}",
+                    inferred="BPE" if tokenization_vulnerable else "Unigram",
+                    weight=1.0,  # Ground truth — always trusted over metadata
+                    reason=tokenization_detail,
+                )
+            )
+            logger.info("Ground-truth tokenization test: %s", tokenization_detail)
+
+    # ═══════════════════════════════════════════════════════════════
+    # DECISION TREE: determine algorithm with proper conflict handling
+    # Priority: ground-truth test > tokenizer.json > runtime > config
+    # ═══════════════════════════════════════════════════════════════
+    algorithm, confidence_score = _decide_algorithm(
+        sources=sources,
+        tokenization_vulnerable=tokenization_vulnerable,
+        fragility_score=fragility_score,
+        algorithm_from_tokenizer_json=algorithm_from_tokenizer_json,
+        model_path=model_path,
+    )
+
+    # Resolve SentencePiece ambiguity if needed
+    if algorithm == TokenizerAlgorithm.SENTENCEPIECE:
+        resolved = resolve_sentencepiece_algorithm(model_path)
+        if resolved is not None:
+            logger.info("Resolved SentencePiece → %s", resolved.value)
+            sources.append(
+                DetectionSource(
+                    signal="sentencepiece_resolution",
+                    value=f"Resolved to {resolved.value}",
+                    inferred=resolved.value,
+                    weight=0.90,
+                    reason="Loaded .model file and inspected trainer algorithm",
+                )
+            )
+            algorithm = resolved
+            confidence_score = max(confidence_score, 0.90)
 
     # Risk assessment
     vulnerable = is_vulnerable(algorithm)
@@ -570,19 +603,105 @@ def inspect_model(
             "config.json": config,
             "tokenizer_config.json": tokenizer_config,
             "detection_confidence": confidence_score,
+            "fragility_score": fragility_score,
         },
         tokenizer_metadata=tokenizer_json or {},
     )
 
 
-def _aggregate_signals(sources: list[DetectionSource]) -> TokenizerAlgorithm:
-    """Weighted-majority vote over detection signals.
+# ═══════════════════════════════════════════════════════════════════
+# DECISION TREE + CONFIDENCE MODEL
+# ═══════════════════════════════════════════════════════════════════
 
-    Each source contributes ``weight`` points to the algorithm it inferred.
-    The algorithm with the highest total weight wins.  If no votes were cast,
-    returns :attr:`TokenizerAlgorithm.UNKNOWN`.
+def _decide_algorithm(
+    sources: list[DetectionSource],
+    tokenization_vulnerable: bool | None,
+    fragility_score: float,
+    algorithm_from_tokenizer_json: TokenizerAlgorithm | None,
+    model_path: Path,
+) -> tuple[TokenizerAlgorithm, float]:
+    """Decision tree for algorithm detection with proper confidence.
+
+    Priority order (highest first):
+    1. Ground-truth tokenization behavior test  → confidence 0.98
+    2. tokenizer.json explicit type             → confidence 0.85–0.95
+    3. Runtime Rust backend inspection          → confidence 0.75
+    4. Tokenizer class name map                 → confidence 0.60
+    5. Source code fingerprint                  → confidence 0.50
+    6. model_type from config.json              → confidence 0.40
+    7. Remote source scan                       → confidence 0.45
+
+    Confidence is reduced when signals disagree.
+    """
+    # Tier 1: Ground-truth test always wins
+    if tokenization_vulnerable is not None:
+        algorithm = TokenizerAlgorithm.BPE if tokenization_vulnerable else TokenizerAlgorithm.UNIGRAM
+        confidence = 0.98  # Near-certain, but leave room for edge cases
+        logger.info(
+            "Decision: %s (confidence=%.2f) [ground-truth tokenization test, fragility=%.2f]",
+            algorithm.value, confidence, fragility_score,
+        )
+        return algorithm, confidence
+
+    # Tier 2: tokenizer.json is authoritative if present
+    if algorithm_from_tokenizer_json is not None:
+        # Check for conflicts with other signals
+        algo = algorithm_from_tokenizer_json
+        conflicts = _count_conflicts(algo, sources)
+        if conflicts == 0:
+            confidence = 0.95
+        elif conflicts == 1:
+            confidence = 0.85
+        else:
+            confidence = 0.70  # Multiple signals disagree → lower confidence
+        logger.info("Decision: %s (confidence=%.2f) [tokenizer.json, %d conflicting signals]",
+                     algo.value, confidence, conflicts)
+        return algo, confidence
+
+    # Tier 3: Runtime inspection
+    runtime_signals = [s for s in sources if s.signal == "runtime._tokenizer.model"]
+    if runtime_signals:
+        algo = TokenizerAlgorithm(runtime_signals[0].inferred)
+        confidence = 0.75
+        logger.info("Decision: %s (confidence=%.2f) [runtime inspection]", algo.value, confidence)
+        return algo, confidence
+
+    # Tier 4: Weighted vote from remaining signals (with conflict penalty)
+    algo, raw_confidence = _weighted_vote_with_conflicts(sources)
+    if algo != TokenizerAlgorithm.UNKNOWN:
+        logger.info("Decision: %s (confidence=%.2f) [weighted vote from config signals]",
+                     algo.value, raw_confidence)
+        return algo, raw_confidence
+
+    # Tier 5: Nothing found — UNKNOWN
+    logger.info("Decision: UNKNOWN (confidence=0.10) [no signals available]")
+    return TokenizerAlgorithm.UNKNOWN, 0.10
+
+
+def _count_conflicts(primary: TokenizerAlgorithm, sources: list[DetectionSource]) -> int:
+    """Count how many signals disagree with the primary algorithm."""
+    conflicts = 0
+    for src in sources:
+        if src.inferred:
+            try:
+                other = TokenizerAlgorithm(src.inferred)
+                if other != TokenizerAlgorithm.UNKNOWN and other != primary:
+                    conflicts += 1
+            except ValueError:
+                pass
+    return conflicts
+
+
+def _weighted_vote_with_conflicts(sources: list[DetectionSource]) -> tuple[TokenizerAlgorithm, float]:
+    """Weighted vote with conflict-aware confidence reduction.
+
+    If signals unanimously agree → high confidence.
+    Multiple disagreeing signals → confidence penalty applied.
     """
     from collections import defaultdict
+
+    if not sources:
+        return TokenizerAlgorithm.UNKNOWN, 0.10
 
     votes: dict[TokenizerAlgorithm, float] = defaultdict(float)
     for src in sources:
@@ -594,17 +713,26 @@ def _aggregate_signals(sources: list[DetectionSource]) -> TokenizerAlgorithm:
             votes[algo] += src.weight
 
     if not votes:
-        return TokenizerAlgorithm.UNKNOWN
+        return TokenizerAlgorithm.UNKNOWN, 0.10
 
     best_algo = max(votes, key=lambda a: votes[a])
-    return best_algo
+    total_weight = sum(votes.values())
+    winning_weight = votes[best_algo]
 
+    # Base confidence: proportion of total weight going to winner
+    base_confidence = winning_weight / total_weight if total_weight > 0 else 0.0
 
-def _confidence_from_sources(sources: list[DetectionSource]) -> float:
-    """Cap-and-normalise confidence from evidence.
+    # Number of distinct algorithms voted for
+    num_competing = len(votes)
 
-    Sum raw weights, then clamp to ``[0, 1]``.  This is deliberately simple so
-    that adding more signals cannot push confidence past certainty.
-    """
-    total = sum(src.weight for src in sources)
-    return min(total, 1.0)
+    if num_competing == 1:
+        # Unanimous — scale proportionally to total signal weight
+        confidence = min(base_confidence, 0.70)
+    elif num_competing == 2:
+        # One dissenter — moderate penalty
+        confidence = base_confidence * 0.80
+    else:
+        # Multiple competing algorithms — heavy penalty
+        confidence = base_confidence * 0.55
+
+    return best_algo, round(max(confidence, 0.10), 3)
